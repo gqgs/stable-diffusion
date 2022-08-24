@@ -13,6 +13,7 @@ from pytorch_lightning import seed_everything
 from torch import autocast
 from contextlib import contextmanager, nullcontext
 from ldm.util import instantiate_from_config
+from random import randint
 
 
 def chunk(it, size):
@@ -133,7 +134,7 @@ parser.add_argument(
 parser.add_argument(
     "--seed",
     type=int,
-    default=42,
+    default=randint(1,2**32),
     help="the seed (for reproducible sampling)",
 )
 parser.add_argument(

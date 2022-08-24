@@ -11,6 +11,8 @@ import time
 from pytorch_lightning import seed_everything
 from torch import autocast
 from contextlib import contextmanager, nullcontext
+from random import randint
+from uuid import uuid4
 
 from ldm.util import instantiate_from_config
 from ldm.models.diffusion.ddim import DDIMSampler
@@ -62,6 +64,7 @@ def main():
     parser.add_argument(
         "--skip_grid",
         action='store_true',
+        default=False,
         help="do not save a grid, only individual samples. Helpful when evaluating lots of samples",
     )
     parser.add_argument(
@@ -164,7 +167,7 @@ def main():
     parser.add_argument(
         "--seed",
         type=int,
-        default=42,
+        default=randint(1,2**32),
         help="the seed (for reproducible sampling)",
     )
     parser.add_argument(
@@ -188,7 +191,7 @@ def main():
     model = load_model_from_config(config, f"{opt.ckpt}")
 
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-    model = model.to(device)
+    model = model.half().to(device)
 
     if opt.plms:
         sampler = PLMSSampler(model)
@@ -251,8 +254,9 @@ def main():
                         if not opt.skip_save:
                             for x_sample in x_samples_ddim:
                                 x_sample = 255. * rearrange(x_sample.cpu().numpy(), 'c h w -> h w c')
+                                img_id = uuid4()
                                 Image.fromarray(x_sample.astype(np.uint8)).save(
-                                    os.path.join(sample_path, f"{base_count:05}.png"))
+                                    os.path.join(sample_path, f"{img_id}.png"))
                                 base_count += 1
 
                         if not opt.skip_grid:

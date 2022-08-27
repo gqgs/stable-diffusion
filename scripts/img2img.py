@@ -3,6 +3,7 @@
 import argparse, os, sys, glob
 import PIL
 import torch
+import torch.nn as nn
 import numpy as np
 from omegaconf import OmegaConf
 from PIL import Image
@@ -21,6 +22,34 @@ from ldm.util import instantiate_from_config
 from ldm.models.diffusion.ddim import DDIMSampler
 from ldm.models.diffusion.plms import PLMSSampler
 
+import k_diffusion as K
+
+class CFGDenoiser(nn.Module):
+    def __init__(self, model):
+        super().__init__()
+        self.inner_model = model
+
+    def forward(self, x, sigma, uncond, cond, cond_scale):
+        x_in = torch.cat([x] * 2)
+        sigma_in = torch.cat([sigma] * 2)
+        cond_in = torch.cat([uncond, cond])
+        uncond, cond = self.inner_model(x_in, sigma_in, cond=cond_in).chunk(2)
+        return uncond + (cond - uncond) * cond_scale
+
+class KDiffusionSampler:
+    def __init__(self, m, sampler):
+        self.model = m
+        self.model_wrap = K.external.CompVisDenoiser(m)
+        self.schedule = sampler
+
+    def sample(self, S, conditioning, batch_size, shape, verbose, unconditional_guidance_scale, unconditional_conditioning, eta, x_T):
+        sigmas = self.model_wrap.get_sigmas(S)
+        x = x_T * sigmas[0]
+        model_wrap_cfg = CFGDenoiser(self.model_wrap)
+
+        samples_ddim = K.sampling.__dict__[f'sample_{self.schedule}'](model_wrap_cfg, x, sigmas, extra_args={'cond': conditioning, 'uncond': unconditional_conditioning, 'cond_scale': unconditional_guidance_scale}, disable=False)
+
+        return samples_ddim, None
 
 def chunk(it, size):
     it = iter(it)
@@ -78,6 +107,19 @@ def main():
     )
 
     parser.add_argument(
+        "--H",
+        type=int,
+        default=512,
+        help="image height, in pixel space",
+    )
+    parser.add_argument(
+        "--W",
+        type=int,
+        default=512,
+        help="image width, in pixel space",
+    )
+
+    parser.add_argument(
         "--outdir",
         type=str,
         nargs="?",
@@ -105,9 +147,11 @@ def main():
     )
 
     parser.add_argument(
-        "--plms",
-        action='store_true',
-        help="use plms sampling",
+        "--sampler",
+        type=str,
+        help="diffusion sampler to be used",
+        choices=["plms", "ddim", "k_dpm_2_a", "k_dpm_2", "k_euler_a", "k_euler", "k_heun", "k_lms"],
+        default="k_euler"
     )
     parser.add_argument(
         "--fixed_code",
@@ -204,11 +248,24 @@ def main():
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     model = model.half().to(device)
 
-    if opt.plms:
-        raise NotImplementedError("PLMS sampler not (yet) supported")
+    if opt.sampler == 'plms':
         sampler = PLMSSampler(model)
-    else:
+    elif opt.sampler == 'ddim':
         sampler = DDIMSampler(model)
+    elif opt.sampler == 'k_dpm_2_a':
+        sampler = KDiffusionSampler(model,'dpm_2_ancestral')
+    elif opt.sampler == 'k_dpm_2':
+        sampler = KDiffusionSampler(model,'dpm_2')
+    elif opt.sampler == 'k_euler_a':
+        sampler = KDiffusionSampler(model,'euler_ancestral')
+    elif opt.sampler == 'k_euler':
+        sampler = KDiffusionSampler(model,'euler')
+    elif opt.sampler == 'k_heun':
+        sampler = KDiffusionSampler(model,'heun')
+    elif opt.sampler == 'k_lms':
+        sampler = KDiffusionSampler(model,'lms')
+    else:
+        raise Exception("Unknown sampler: " + sampler_name)
 
     os.makedirs(opt.outdir, exist_ok=True)
     outpath = opt.outdir
@@ -236,11 +293,31 @@ def main():
     init_image = repeat(init_image, '1 ... -> b ...', b=batch_size)
     init_latent = model.get_first_stage_encoding(model.encode_first_stage(init_image))  # move to latent space
 
-    sampler.make_schedule(ddim_num_steps=opt.ddim_steps, ddim_eta=opt.ddim_eta, verbose=False)
-
     assert 0. <= opt.strength <= 1., 'can only work with strength in [0.0, 1.0]'
     t_enc = int(opt.strength * opt.ddim_steps)
     print(f"target t_enc is {t_enc} steps")
+
+
+    def sample(init_data, x, conditioning, unconditional_conditioning, sampler_name):
+        if sampler_name != 'DDIM':
+            x0, = init_data
+
+            sigmas = sampler.model_wrap.get_sigmas(opt.ddim_steps)
+            noise = x * sigmas[opt.ddim_steps - t_enc - 1]
+
+            xi = x0 + noise
+            sigma_sched = sigmas[opt.ddim_steps - t_enc - 1:]
+            model_wrap_cfg = CFGDenoiser(sampler.model_wrap)
+            samples_ddim = K.sampling.sample_lms(model_wrap_cfg, xi, sigma_sched, extra_args={'cond': conditioning, 'uncond': unconditional_conditioning, 'cond_scale': opt.scale}, disable=False)
+        else:
+            x0, = init_data
+            sampler.make_schedule(ddim_num_steps=opt.ddim_steps, ddim_eta=0.0, verbose=False)
+            z_enc = sampler.stochastic_encode(x0, torch.tensor([t_enc]*batch_size).to(device))
+                                # decode it
+            samples_ddim = sampler.decode(z_enc, conditioning, t_enc,
+                                            unconditional_guidance_scale=opt.scale,
+                                            unconditional_conditioning=unconditional_conditioning,)
+        return samples_ddim
 
     precision_scope = autocast if opt.precision == "autocast" else nullcontext
     with torch.no_grad():
@@ -257,11 +334,8 @@ def main():
                             prompts = list(prompts)
                         c = model.get_learned_conditioning(prompts)
 
-                        # encode (scaled latent)
-                        z_enc = sampler.stochastic_encode(init_latent, torch.tensor([t_enc]*batch_size).to(device))
-                        # decode it
-                        samples = sampler.decode(z_enc, c, t_enc, unconditional_guidance_scale=opt.scale,
-                                                 unconditional_conditioning=uc,)
+                        x = torch.randn([opt.n_samples, opt.C, opt.H // opt.f, opt.W // opt.f], device=device)
+                        samples = sample(init_latent, x, c, uc, opt.sampler)
 
                         x_samples = model.decode_first_stage(samples)
                         x_samples = torch.clamp((x_samples + 1.0) / 2.0, min=0.0, max=1.0)

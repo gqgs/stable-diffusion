@@ -1,5 +1,6 @@
 import argparse, os, sys, glob
 import torch
+import torch.nn as nn
 import numpy as np
 from omegaconf import OmegaConf
 from PIL import Image
@@ -17,6 +18,35 @@ from uuid import uuid4
 from ldm.util import instantiate_from_config
 from ldm.models.diffusion.ddim import DDIMSampler
 from ldm.models.diffusion.plms import PLMSSampler
+
+import k_diffusion as K
+
+class CFGDenoiser(nn.Module):
+    def __init__(self, model):
+        super().__init__()
+        self.inner_model = model
+
+    def forward(self, x, sigma, uncond, cond, cond_scale):
+        x_in = torch.cat([x] * 2)
+        sigma_in = torch.cat([sigma] * 2)
+        cond_in = torch.cat([uncond, cond])
+        uncond, cond = self.inner_model(x_in, sigma_in, cond=cond_in).chunk(2)
+        return uncond + (cond - uncond) * cond_scale
+
+class KDiffusionSampler:
+    def __init__(self, m, sampler):
+        self.model = m
+        self.model_wrap = K.external.CompVisDenoiser(m)
+        self.schedule = sampler
+
+    def sample(self, S, conditioning, batch_size, shape, verbose, unconditional_guidance_scale, unconditional_conditioning, eta, x_T):
+        sigmas = self.model_wrap.get_sigmas(S)
+        x = x_T * sigmas[0]
+        model_wrap_cfg = CFGDenoiser(self.model_wrap)
+
+        samples_ddim = K.sampling.__dict__[f'sample_{self.schedule}'](model_wrap_cfg, x, sigmas, extra_args={'cond': conditioning, 'uncond': unconditional_conditioning, 'cond_scale': unconditional_guidance_scale}, disable=False)
+
+        return samples_ddim, None
 
 
 def chunk(it, size):
@@ -77,11 +107,6 @@ def main():
         type=int,
         default=50,
         help="number of ddim sampling steps",
-    )
-    parser.add_argument(
-        "--plms",
-        action='store_true',
-        help="use plms sampling",
     )
     parser.add_argument(
         "--laion400m",
@@ -177,6 +202,13 @@ def main():
         choices=["full", "autocast"],
         default="autocast"
     )
+    parser.add_argument(
+        "--sampler",
+        type=str,
+        help="diffusion sampler to be used",
+        choices=["plms", "ddim", "k_dpm_2_a", "k_dpm_2", "k_euler_a", "k_euler", "k_heun", "k_lms"],
+        default="k_euler"
+    )
     opt = parser.parse_args()
 
     if opt.laion400m:
@@ -193,10 +225,24 @@ def main():
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     model = model.half().to(device)
 
-    if opt.plms:
+    if opt.sampler == 'plms':
         sampler = PLMSSampler(model)
-    else:
+    elif opt.sampler == 'ddim':
         sampler = DDIMSampler(model)
+    elif opt.sampler == 'k_dpm_2_a':
+        sampler = KDiffusionSampler(model,'dpm_2_ancestral')
+    elif opt.sampler == 'k_dpm_2':
+        sampler = KDiffusionSampler(model,'dpm_2')
+    elif opt.sampler == 'k_euler_a':
+        sampler = KDiffusionSampler(model,'euler_ancestral')
+    elif opt.sampler == 'k_euler':
+        sampler = KDiffusionSampler(model,'euler')
+    elif opt.sampler == 'k_heun':
+        sampler = KDiffusionSampler(model,'heun')
+    elif opt.sampler == 'k_lms':
+        sampler = KDiffusionSampler(model,'lms')
+    else:
+        raise Exception("Unknown sampler: " + sampler_name)
 
     os.makedirs(opt.outdir, exist_ok=True)
     outpath = opt.outdir
@@ -219,9 +265,9 @@ def main():
     base_count = len(os.listdir(sample_path))
     grid_count = len(os.listdir(outpath)) - 1
 
-    start_code = None
-    if opt.fixed_code:
-        start_code = torch.randn([opt.n_samples, opt.C, opt.H // opt.f, opt.W // opt.f], device=device)
+    #start_code = None
+    #if opt.fixed_code:
+    #    start_code = torch.randn([opt.n_samples, opt.C, opt.H // opt.f, opt.W // opt.f], device=device)
 
     precision_scope = autocast if opt.precision=="autocast" else nullcontext
     with torch.no_grad():
@@ -231,6 +277,7 @@ def main():
                 all_samples = list()
                 for n in trange(opt.n_iter, desc="Sampling"):
                     for prompts in tqdm(data, desc="data"):
+                        start_code = torch.randn([opt.n_samples, opt.C, opt.H // opt.f, opt.W // opt.f], device=device)
                         uc = None
                         if opt.scale != 1.0:
                             uc = model.get_learned_conditioning(batch_size * [""])
